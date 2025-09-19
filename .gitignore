@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# SQLite cache
+app/daily_words.db
+
+# IDE
+.vscode/
+.idea/
