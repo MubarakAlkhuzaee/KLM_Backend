@@ -1,14 +1,66 @@
-# ...existing imports...
-from .ksaa_client import KSAAClient, pick_index_for_date, base_len_ar, is_ar_letters_only, normalize_entry_id, normalize_word
+# app/main.py
+from datetime import datetime
+import pytz
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-MAX_PROBES = 40          # how many entries to try before giving up
-MIN_LEN, MAX_LEN = 4, 7  # Wordle-like length range (after stripping diacritics)
+# --- create app FIRST ---
+app = FastAPI(title="Wordle Daily Arabic Word")
+
+# CORS (needed if you call from browser / Godot Web)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # lock down to your domain(s) later
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+# --- imports that depend on app existing are fine after this ---
+from .db_pg import Base, engine, SessionLocal, ping           # Postgres helpers
+from .models import DailyWordCache                            # SQLAlchemy models
+from .ksaa_client import (                                    # Upstream client + helpers
+    KSAAClient, pick_index_for_date,
+    base_len_ar, is_ar_letters_only, normalize_entry_id, normalize_word
+)
+
+TZ = pytz.timezone("Asia/Riyadh")
+MIN_LEN, MAX_LEN = 4, 7         # Wordle-like length
+MAX_PROBES = 40                 # How many entries to try to find a good one
+
+# ---- Pydantic response models ----
+class DailyWord(BaseModel):
+    date: str
+    word: str
+    definition: str | None = None
+    entry_id: str | None = None
+    lexicon_id: str | None = None
+    source: str = "معجم الرياض للغة العربية المعاصرة"
+
+# ---- DB dependency ----
+async def get_db() -> AsyncSession:
+    async with SessionLocal() as session:
+        yield session
+
+# ---- lifecycle ----
+@app.on_event("startup")
+async def on_startup():
+    await ping()  # ensure DB reachable
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+# ---- routes ----
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
 
 @app.get("/daily-word", response_model=DailyWord)
 async def daily_word(db: AsyncSession = Depends(get_db)):
     ymd = datetime.now(TZ).strftime("%Y-%m-%d")
 
-    # 1) check DB cache
+    # 1) cache
     res = await db.execute(select(DailyWordCache).where(DailyWordCache.ymd == ymd))
     row = res.scalar_one_or_none()
     if row:
@@ -20,6 +72,7 @@ async def daily_word(db: AsyncSession = Depends(get_db)):
             lexicon_id=row.lexicon_id,
         )
 
+    # 2) fetch from upstream and probe until a playable word
     client = KSAAClient()
     try:
         lexicon_id = await client.find_lexicon_id()
@@ -38,10 +91,7 @@ async def daily_word(db: AsyncSession = Depends(get_db)):
             entry = await client.get_entry_by_index(lexicon_id=lexicon_id, index=idx)
 
             word = normalize_word(entry)
-            if not word:
-                continue
-
-            if not is_ar_letters_only(word):
+            if not word or not is_ar_letters_only(word):
                 continue
 
             L = base_len_ar(word)
@@ -52,13 +102,10 @@ async def daily_word(db: AsyncSession = Depends(get_db)):
             definition = None
             if eid:
                 senses = await client.get_senses(eid)
-                # Try to pull Arabic definition
                 for s in senses:
                     definition = (
-                        s.get("definition_ar") or
-                        s.get("definition") or
-                        s.get("gloss_ar") or
-                        s.get("gloss")
+                        s.get("definition_ar") or s.get("definition") or
+                        s.get("gloss_ar") or s.get("gloss")
                     )
                     if not definition:
                         defs = s.get("definitions") or s.get("definitionList")
@@ -69,17 +116,15 @@ async def daily_word(db: AsyncSession = Depends(get_db)):
                     if definition:
                         break
 
-            # Accept if we have a decent word; definition optional but preferred
-            chosen_word = word
-            chosen_def  = definition
-            chosen_eid  = eid
+            # accept this word; prefer ones with definition
+            chosen_word, chosen_def, chosen_eid = word, definition, eid
             if definition:
-                break  # prefer first with definition
+                break
 
         if not chosen_word:
             raise HTTPException(status_code=502, detail="Could not find a suitable word today")
 
-        # Save cache
+        # 3) save cache
         db.add(DailyWordCache(
             ymd=ymd,
             word=chosen_word,
@@ -94,7 +139,7 @@ async def daily_word(db: AsyncSession = Depends(get_db)):
             word=chosen_word,
             definition=chosen_def,
             entry_id=chosen_eid,
-            lexicon_id=lexicon_id
+            lexicon_id=lexicon_id,
         )
     except HTTPException:
         raise
