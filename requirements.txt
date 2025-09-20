@@ -3,3 +3,7 @@ uvicorn==0.30.6
 httpx==0.27.2
 pydantic==2.9.1
 pytz==2025.1
+SQLAlchemy==2.0.32
+asyncpg==0.29.0
+passlib[bcrypt]==1.7.4      # for password hashing (users)
+python-dotenv==1.0.1        # optional if you run locally
