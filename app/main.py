@@ -60,12 +60,12 @@ async def daily_word(db: AsyncSession = Depends(get_db)):
     client = KSAAClient()
     try:
         lexicon_id = await client.find_lexicon_id()
-        total = await client.count_candidates(lexicon_id=lexicon_id, q="")
+        total = await client.count_candidates(lexicon_id=lexicon_id, query="")
         if total == 0:
             raise HTTPException(status_code=502, detail="No entries found in the target lexicon")
 
         index = pick_index_for_date(ymd, total)
-        entry = await client.get_entry_by_index(lexicon_id=lexicon_id, index=index, q="")
+        entry = await client.get_entry_by_index(lexicon_id=lexicon_id, index=index, query="")
         entry_id = entry.get("id") or entry.get("entryId") or entry.get("uuid")
         word = entry.get("lemma") or entry.get("form") or entry.get("headword") or entry.get("word") or ""
 
