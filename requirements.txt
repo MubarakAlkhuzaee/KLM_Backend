@@ -7,3 +7,4 @@ SQLAlchemy==2.0.32
 asyncpg==0.29.0
 passlib[bcrypt]==1.7.4      # for password hashing (users)
 python-dotenv==1.0.1        # optional if you run locally
+email-validator==2.2.0
