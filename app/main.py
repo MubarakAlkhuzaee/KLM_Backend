@@ -1,123 +1,121 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from datetime import date
+import random
 import httpx
 import os
-import random
 
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy import select
-
+from app.database import get_session, engine
 from app.models import Base, DailyWordCache
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-SIWAR_API_KEY = os.getenv("SIWAR_API_KEY")
-LEXICON_ID = "Riyadh"
 
 app = FastAPI()
 
-engine = create_async_engine(DATABASE_URL, echo=False)
-AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-
+# ─────────────────────────────────────────────
+# 🧱 Pydantic response model
+# ─────────────────────────────────────────────
 class DailyWord(BaseModel):
     date: str
     word: str
     definition: str | None = None
     entry_id: str | None = None
-    lexicon_id: str
-    source: str
+    lexicon_id: str | None = None
+    source: str = "معجم الرياض للغة العربية المعاصرة"
 
 
-@app.on_event("startup")
-async def on_startup():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+# ─────────────────────────────────────────────
+# 🔌 Helper to fetch random word from Siwar API
+# ─────────────────────────────────────────────
+async def fetch_random_word_from_siwar(query: str) -> DailyWord | None:
+    headers = {
+        "accept": "application/json",
+        "apikey": os.getenv("SIWAR_API_KEY"),
+    }
 
+    url = "https://siwar.ksaa.gov.sa/api/v1/external/public/search"
+    params = {
+        "query": query,
+        "lexiconId": "Riyadh",
+        "offset": 0,
+        "limit": 1
+    }
 
-@app.get("/daily-word", response_model=DailyWord)
-async def get_daily_word(refresh: bool = Query(default=False)):
-    today = str(date.today())
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, headers=headers, params=params)
 
-    async with AsyncSessionLocal() as session:
-        if not refresh:
-            # Try cache
-            cached = await session.get(DailyWordCache, today)
-            if cached:
-                return DailyWord(
-                    date=today,
-                    word=cached.word,
-                    definition=cached.definition,
-                    entry_id=cached.entry_id,
-                    lexicon_id=cached.lexicon_id,
-                    source="معجم الرياض للغة العربية المعاصرة"
-                )
+        if response.status_code != 200:
+            raise Exception(response.text)
 
-        # No cache or forced refresh — get random word
-        random_offset = random.randint(0, 3000)
-
-        async with httpx.AsyncClient() as client:
-            res = await client.get(
-                "https://siwar.ksaa.gov.sa/api/v1/external/public/search",
-                params={
-                    "lexiconId": LEXICON_ID,
-                    "offset": random_offset,
-                    "limit": 1
-                },
-                headers={
-                    "accept": "application/json",
-                    "apikey": SIWAR_API_KEY
-                }
-            )
-
-        if res.status_code != 200:
-            return {"detail": f"Upstream failure: {res.text}"}
-
-        data = res.json()
-        if not data or "content" not in data or not data["content"]:
-            return {"detail": "Could not find a suitable word today"}
+        data = response.json()
+        if not data or "content" not in data or len(data["content"]) == 0:
+            return None
 
         entry = data["content"][0]
-        word = entry.get("entryHead", "")
-        entry_id = entry.get("entryId", None)
-
-        # Get definition
-        definition = None
-        if entry_id:
-            async with httpx.AsyncClient() as client:
-                def_res = await client.get(
-                    "https://siwar.ksaa.gov.sa/api/v1/external/public/senses",
-                    params={
-                        "entryId": entry_id,
-                        "lexiconId": LEXICON_ID
-                    },
-                    headers={
-                        "accept": "application/json",
-                        "apikey": SIWAR_API_KEY
-                    }
-                )
-            if def_res.status_code == 200:
-                senses = def_res.json()
-                if senses:
-                    definition = senses[0].get("definition", {}).get("value")
-
-        # Cache it
-        obj = DailyWordCache(
-            ymd=today,
-            word=word,
-            definition=definition,
-            entry_id=entry_id,
-            lexicon_id=LEXICON_ID
-        )
-        await session.merge(obj)
-        await session.commit()
 
         return DailyWord(
-            date=today,
-            word=word,
-            definition=definition,
-            entry_id=entry_id,
-            lexicon_id=LEXICON_ID,
-            source="معجم الرياض للغة العربية المعاصرة"
+            date=str(date.today()),
+            word=entry["title"],
+            definition=entry.get("definition"),
+            entry_id=entry.get("id"),
+            lexicon_id="Riyadh",
         )
+
+
+# ─────────────────────────────────────────────
+# 🚀 API route: /daily-word
+# ─────────────────────────────────────────────
+@app.get("/daily-word", response_model=DailyWord)
+async def get_daily_word(refresh: bool = False, session: AsyncSession = Depends(get_session)):
+    today = date.today().isoformat()
+
+    # Check if already exists in DB
+    if not refresh:
+        existing = await session.get(DailyWordCache, today)
+        if existing:
+            return DailyWord(
+                date=existing.ymd,
+                word=existing.word,
+                definition=existing.definition,
+                entry_id=existing.entry_id,
+                lexicon_id=existing.lexicon_id
+            )
+
+    # Pick random query letter (more letters = more diversity)
+    query = random.choice(["س", "م", "ن", "ك", "ر", "ب", "ط", "ع", "ف", "و", "خ", "ج"])
+
+    try:
+        word = await fetch_random_word_from_siwar(query=query)
+
+        if word is None or not word.word:
+            raise Exception("Could not find a suitable word today")
+
+        # Save to DB
+        cache_entry = DailyWordCache(
+            ymd=today,
+            word=word.word,
+            definition=word.definition,
+            entry_id=word.entry_id,
+            lexicon_id=word.lexicon_id
+        )
+        session.add(cache_entry)
+        await session.commit()
+
+        return word
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Upstream failure: {str(e)}"}
+        )
+
+
+# ─────────────────────────────────────────────
+# 🌱 Create DB tables if they don't exist
+# ─────────────────────────────────────────────
+@app.on_event("startup")
+async def startup_event():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
