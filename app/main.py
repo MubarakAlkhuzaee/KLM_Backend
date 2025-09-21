@@ -1,10 +1,10 @@
 # app/main.py
 from __future__ import annotations
+
 from datetime import datetime
-import os
-import re
 import secrets
-from typing import Optional, List
+import re
+from typing import Optional, List, Tuple
 
 import pytz
 from fastapi import FastAPI, HTTPException, Depends, Query
@@ -20,18 +20,20 @@ from .ksaa_client import KSAAClient
 
 # ───────── Config ─────────
 TZ = pytz.timezone("Asia/Riyadh")
-MIN_LEN, MAX_LEN = 4, 7
+MIN_LEN, MAX_LEN = 4, 7               # playable length after removing diacritics
 BATCH_SIZE = 50
 MAX_RANDOM_TRIES = 12
-SEED_LETTERS = ["ا","ب","ت","ث","ج","ح","خ","د","ذ","ر","ز",
-                "س","ش","ص","ض","ط","ظ","ع","غ","ف","ق","ك","ل","م","ن","ه","و","ي"]
+SEED_LETTERS = [
+    "ا","ب","ت","ث","ج","ح","خ","د","ذ","ر","ز",
+    "س","ش","ص","ض","ط","ظ","ع","غ","ف","ق","ك","ل","م","ن","ه","و","ي"
+]
 
 # ───────── App ─────────
 app = FastAPI(title="Kalam API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later
+    allow_origins=["*"],      # tighten later
     allow_methods=["GET","POST","OPTIONS"],
     allow_headers=["*"],
 )
@@ -40,15 +42,15 @@ app.add_middleware(
 class DailyWord(BaseModel):
     date: str
     word: str
-    definition: str | None = None
-    entry_id: str | None = None
-    lexicon_id: str | None = None
+    definition: Optional[str] = None
+    entry_id: Optional[str] = None
+    lexicon_id: Optional[str] = None
     source: str = "معجم الرياض للغة العربية المعاصرة"
 
 class WordItem(BaseModel):
-    word: str              # diacritics preserved
-    bare: str              # diacritics removed
-    length: int            # len(bare)
+    word: str          # diacritics preserved
+    bare: str          # diacritics removed
+    length: int        # len(bare)
     definition: Optional[str] = None
     entry_id: Optional[str] = None
 
@@ -63,7 +65,7 @@ async def get_db() -> AsyncSession:
     async with SessionLocal() as session:
         yield session
 
-# ───────── Helpers (Arabic validation/normalization) ─────────
+# ───────── Helpers (Arabic normalization) ─────────
 _AR_DIACRITICS = re.compile(r"[\u064B-\u0652\u0670]")  # tashkeel + dagger alif
 _AR_LETTERS    = re.compile(r"^[\u0621-\u064A]+$")
 
@@ -78,10 +80,12 @@ def is_ar_letters_only(s: str) -> bool:
     return bool(b) and bool(_AR_LETTERS.match(b))
 
 def normalize_word(entry: dict) -> str:
+    # common headword fields
     for k in ("lemma","form","headword","word","display","text","title","entryHead"):
         v = entry.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
+    # sometimes nested
     form = entry.get("form")
     if isinstance(form, dict):
         for k in ("text","value","form"):
@@ -90,7 +94,7 @@ def normalize_word(entry: dict) -> str:
                 return v.strip()
     return ""
 
-def normalize_entry_id(entry: dict):
+def normalize_entry_id(entry: dict) -> Optional[str]:
     for k in ("id","entryId","lexicalEntryId","uuid","uid","eid"):
         v = entry.get(k)
         if isinstance(v, (str,int)) and str(v).strip():
@@ -103,7 +107,7 @@ def normalize_entry_id(entry: dict):
                 return str(v)
     return None
 
-def extract_definition_from_senses(senses: list) -> str | None:
+def extract_definition_from_senses(senses: list) -> Optional[str]:
     for s in senses or []:
         definition = (
             s.get("definition_ar") or
@@ -115,7 +119,8 @@ def extract_definition_from_senses(senses: list) -> str | None:
             defs = s.get("definitions") or s.get("definitionList")
             if isinstance(defs, list) and defs:
                 ar = next(
-                    (d.get("text") for d in defs if isinstance(d, dict) and d.get("lang") in ("ar","ara","ar-SA")),
+                    (d.get("text") for d in defs
+                     if isinstance(d, dict) and d.get("lang") in ("ar","ara","ar-SA")),
                     None
                 )
                 definition = ar or (defs[0].get("text") if isinstance(defs[0], dict) else (defs[0] if defs else None))
@@ -168,7 +173,7 @@ async def daily_word(
             raise HTTPException(status_code=502, detail="No entries found in the target lexicon")
 
         has_batch = hasattr(client, "search_batch")
-        chosen: tuple[str, str | None, str | None] | None = None
+        chosen: Optional[Tuple[str, Optional[str], Optional[str]]] = None  # (word, def, entry_id)
 
         for _attempt in range(MAX_RANDOM_TRIES):
             seed = SEED_LETTERS[secrets.randbelow(len(SEED_LETTERS))]
@@ -260,7 +265,7 @@ async def daily_word(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream failure: {e}")
 
-# ───────── /words (multiple words with diacritics + definitions; no DB cache) ─────────
+# ───────── internal collector for /words ─────────
 async def _collect_words(
     client: KSAAClient,
     lexicon_id: str,
@@ -270,9 +275,13 @@ async def _collect_words(
     max_len: int,
     batch_size: int = 50,
     max_attempts: int = 30,
-) -> list[tuple[str, str | None, str | None]]:
-    have = []
-    seen = set()
+) -> List[Tuple[str, Optional[str], Optional[str]]]:
+    """
+    Collect up to `need` words as (word_with_diacritics, definition, entry_id).
+    Requires a non-empty definition.
+    """
+    have: List[Tuple[str, Optional[str], Optional[str]]] = []
+    seen: set[str] = set()
     has_batch = hasattr(client, "search_batch")
 
     attempts = 0
@@ -301,7 +310,7 @@ async def _collect_words(
                     continue
 
         for entry in items:
-            word = normalize_word(entry)   # diacritics preserved
+            word = normalize_word(entry)  # diacritics preserved
             if not word or not is_ar_letters_only(word):
                 continue
             bare = strip_diacritics(word)
@@ -316,9 +325,8 @@ async def _collect_words(
             if eid:
                 senses = await client.get_senses(eid)
                 definition = extract_definition_from_senses(senses)
-
             if not definition:
-                continue  # require definition for this endpoint
+                continue  # require a definition
 
             have.append((word, definition, eid))
             seen.add(word)
@@ -327,6 +335,7 @@ async def _collect_words(
 
     return have
 
+# ───────── /words (multiple words with diacritics + definitions; no DB cache) ─────────
 @app.get("/words", response_model=WordListResponse)
 async def list_words(
     count: int = Query(10, ge=1, le=100, description="How many words to return"),
@@ -357,4 +366,25 @@ async def list_words(
             max_attempts=40,
         )
 
-        items:
+        items_out: List[WordItem] = []
+        for (word, definition, eid) in triples:
+            bare = strip_diacritics(word)
+            items_out.append(WordItem(
+                word=word,
+                bare=bare,
+                length=len(bare),
+                definition=definition,
+                entry_id=eid
+            ))
+
+        return WordListResponse(
+            date=ymd,
+            lexicon_id=lexicon_id,
+            count=len(items_out),
+            items=items_out
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Upstream failure: {e}")
