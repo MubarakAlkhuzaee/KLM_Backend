@@ -1,57 +1,20 @@
-import hashlib, os, re
+# app/ksaa_client.py
+from __future__ import annotations
+import os
 from typing import Any, Dict, List, Optional
 import httpx
+import hashlib
 
 API_BASE = os.getenv("KSAA_API_BASE", "https://siwar.ksaa.gov.sa/api/v1/external")
 API_KEY = os.getenv("KSAA_API_KEY")
-LEXICON_ID = os.getenv("KSAA_LEXICON_ID")  # e.g., "Riyadh"
+LEXICON_ID_ENV = os.getenv("KSAA_LEXICON_ID")   # e.g., "Riyadh"
 LEXICON_NAME = os.getenv("KSAA_LEXICON_NAME", "معجم الرياض للغة العربية المعاصرة")
 
 HEADERS = {"accept": "application/json", "apikey": API_KEY}
-DEFAULT_QUERY = "ا"  # ensure non-empty
+DEFAULT_QUERY = "ا"  # never send empty query
 
-_AR_DIACRITICS = re.compile(r"[\u064B-\u0652\u0670]")  # tanween, fatha/damma/… , sukun, dagger alif
-_AR_LETTERS    = re.compile(r"^[\u0621-\u064A]+$")     # Hamza..Yeh (base letters only)
-
-def strip_diacritics(s: str) -> str:
-    return _AR_DIACRITICS.sub("", s or "")
-
-def base_len_ar(s: str) -> int:
-    return len(strip_diacritics(s))
-
-def is_ar_letters_only(s: str) -> bool:
-    b = strip_diacritics(s)
-    return bool(b) and bool(_AR_LETTERS.match(b))
-
-def normalize_word(entry: Dict[str, Any]) -> str:
-    # Try common headword fields
-    for k in ("lemma", "form", "headword", "word", "display", "text", "title"):
-        v = entry.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    # Sometimes nested like entry["form"]["text"]
-    form = entry.get("form")
-    if isinstance(form, dict):
-        for k in ("text", "value", "form"):
-            v = form.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-    return ""
-
-def normalize_entry_id(entry: Dict[str, Any]) -> Optional[str]:
-    # Try typical identifiers
-    for k in ("id", "entryId", "lexicalEntryId", "uuid", "uid", "eid"):
-        v = entry.get(k)
-        if isinstance(v, (str, int)) and str(v).strip():
-            return str(v)
-    # Sometimes nested ids
-    meta = entry.get("meta") or entry.get("metadata") or {}
-    if isinstance(meta, dict):
-        for k in ("id", "entryId", "lexicalEntryId"):
-            v = meta.get(k)
-            if isinstance(v, (str, int)) and str(v).strip():
-                return str(v)
-    return None
+def _q(q: Optional[str]) -> str:
+    return q if (q and str(q).strip()) else DEFAULT_QUERY
 
 async def _http_get(path: str, params: Dict[str, Any]):
     async with httpx.AsyncClient(timeout=30) as client:
@@ -59,20 +22,18 @@ async def _http_get(path: str, params: Dict[str, Any]):
         r.raise_for_status()
         return r.json()
 
-def _q(q: Optional[str]) -> str:
-    return q if (q and str(q).strip()) else DEFAULT_QUERY
-
 def _collect_total(data: Any) -> int:
     if isinstance(data, dict):
-        for k in ("total", "count"):
-            if isinstance(data.get(k), int):
-                return int(data[k])
+        if isinstance(data.get("total"), int):
+            return int(data["total"])
+        if isinstance(data.get("count"), int):
+            return int(data["count"])
         pg = data.get("page")
         if isinstance(pg, dict) and isinstance(pg.get("totalElements"), int):
             return int(pg["totalElements"])
-        if "items" in data and isinstance(data["items"], list):
+        if isinstance(data.get("items"), list):
             return max(1, len(data["items"]))
-        if "content" in data and isinstance(data["content"], list):
+        if isinstance(data.get("content"), list):
             return max(1, len(data["content"]))
     elif isinstance(data, list):
         return max(1, len(data))
@@ -94,8 +55,10 @@ class KSAAClient:
             raise RuntimeError("KSAA_API_KEY is not set")
 
     async def find_lexicon_id(self) -> str:
-        if LEXICON_ID:
-            return LEXICON_ID
+        # trust explicit env var (can be a code like "Riyadh")
+        if LEXICON_ID_ENV:
+            return LEXICON_ID_ENV
+        # otherwise resolve by name from public lexicons
         data = await _http_get("/public/lexicons", {})
         items = data if isinstance(data, list) else data.get("items", [])
         for it in items:
@@ -134,8 +97,12 @@ class KSAAClient:
             raise RuntimeError("No entries returned for that index")
         return items[0]
 
+    async def search_batch(self, lexicon_id: str, offset: int, limit: int, query: Optional[str] = None):
+        """Fetch a batch of entries using whichever param style the API accepts."""
+        return await self._search_try_both(query or DEFAULT_QUERY, lexicon_id, offset=offset, limit=limit)
+
     async def get_senses(self, entry_id: str) -> List[Dict[str, Any]]:
-        # Try multiple param names
+        # Try multiple param shapes
         for params in ({"entryId": entry_id}, {"entryIds": entry_id}, {"lexicalEntryId": entry_id}):
             try:
                 data = await _http_get("/public/senses", params)

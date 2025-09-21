@@ -1,13 +1,14 @@
 # app/main.py
+from __future__ import annotations
 from datetime import datetime
 import os
 import re
 import secrets
-import pytz
+from typing import Optional, List
 
+import pytz
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,15 +16,10 @@ from sqlalchemy.dialects.postgresql import insert
 
 from .db_pg import Base, engine, SessionLocal, ping
 from .models import DailyWordCache
-from .ksaa_client import KSAAClient  # must provide: find_lexicon_id, count_candidates, get_entry_by_index
-# (Optional) If your ksaa_client has search_batch(), this file will use it automatically.
+from .ksaa_client import KSAAClient
 
 # ───────── Config ─────────
 TZ = pytz.timezone("Asia/Riyadh")
-LEXICON_NAME = os.getenv("KSAA_LEXICON_NAME", "معجم الرياض للغة العربية المعاصرة")
-# If you set KSAA_LEXICON_ID="Riyadh" in Railway, ksaa_client.find_lexicon_id() will use it.
-
-# Playable word constraints
 MIN_LEN, MAX_LEN = 4, 7
 BATCH_SIZE = 50
 MAX_RANDOM_TRIES = 12
@@ -31,7 +27,7 @@ SEED_LETTERS = ["ا","ب","ت","ث","ج","ح","خ","د","ذ","ر","ز",
                 "س","ش","ص","ض","ط","ظ","ع","غ","ف","ق","ك","ل","م","ن","ه","و","ي"]
 
 # ───────── App ─────────
-app = FastAPI(title="Kalam Daily Word")
+app = FastAPI(title="Kalam API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,7 +36,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ───────── Pydantic model ─────────
+# ───────── Pydantic models ─────────
 class DailyWord(BaseModel):
     date: str
     word: str
@@ -48,6 +44,19 @@ class DailyWord(BaseModel):
     entry_id: str | None = None
     lexicon_id: str | None = None
     source: str = "معجم الرياض للغة العربية المعاصرة"
+
+class WordItem(BaseModel):
+    word: str              # diacritics preserved
+    bare: str              # diacritics removed
+    length: int            # len(bare)
+    definition: Optional[str] = None
+    entry_id: Optional[str] = None
+
+class WordListResponse(BaseModel):
+    date: str
+    lexicon_id: Optional[str] = None
+    count: int
+    items: List[WordItem]
 
 # ───────── DB dependency ─────────
 async def get_db() -> AsyncSession:
@@ -125,7 +134,7 @@ async def on_startup():
 async def healthz():
     return {"ok": True}
 
-# ───────── Route: /daily-word ─────────
+# ───────── /daily-word (random; saved once per day; refreshable) ─────────
 @app.get("/daily-word", response_model=DailyWord)
 async def daily_word(
     db: AsyncSession = Depends(get_db),
@@ -158,7 +167,6 @@ async def daily_word(
         if total <= 0:
             raise HTTPException(status_code=502, detail="No entries found in the target lexicon")
 
-        # Try up to N random batches using seed letters so 'query' is never empty
         has_batch = hasattr(client, "search_batch")
         chosen: tuple[str, str | None, str | None] | None = None
 
@@ -168,7 +176,6 @@ async def daily_word(
 
             if has_batch:
                 data = await client.search_batch(lexicon_id=lexicon_id, offset=start, limit=BATCH_SIZE, query=seed)
-                # normalize items
                 if isinstance(data, list):
                     items = data
                 elif isinstance(data, dict):
@@ -180,8 +187,7 @@ async def daily_word(
                     word = normalize_word(entry)
                     if not word or not is_ar_letters_only(word):
                         continue
-                    L = base_len_ar(word)
-                    if not (MIN_LEN <= L <= MAX_LEN):
+                    if not (MIN_LEN <= base_len_ar(word) <= MAX_LEN):
                         continue
                     eid = normalize_entry_id(entry)
                     definition = None
@@ -199,7 +205,7 @@ async def daily_word(
                 if best_valid and not chosen:
                     chosen = best_valid
             else:
-                # Single-entry probe near random start
+                # single-entry probe near random start
                 probe_window = min(BATCH_SIZE, total)
                 best_valid = None
                 for step in range(probe_window):
@@ -208,8 +214,7 @@ async def daily_word(
                     word = normalize_word(entry)
                     if not word or not is_ar_letters_only(word):
                         continue
-                    L = base_len_ar(word)
-                    if not (MIN_LEN <= L <= MAX_LEN):
+                    if not (MIN_LEN <= base_len_ar(word) <= MAX_LEN):
                         continue
                     eid = normalize_entry_id(entry)
                     definition = None
@@ -253,5 +258,103 @@ async def daily_word(
     except HTTPException:
         raise
     except Exception as e:
-        # Return a nice JSON error but still obey response_model by raising
-        return JSONResponse(status_code=500, content={"detail": f"Upstream failure: {e}"})
+        raise HTTPException(status_code=502, detail=f"Upstream failure: {e}")
+
+# ───────── /words (multiple words with diacritics + definitions; no DB cache) ─────────
+async def _collect_words(
+    client: KSAAClient,
+    lexicon_id: str,
+    total: int,
+    need: int,
+    min_len: int,
+    max_len: int,
+    batch_size: int = 50,
+    max_attempts: int = 30,
+) -> list[tuple[str, str | None, str | None]]:
+    have = []
+    seen = set()
+    has_batch = hasattr(client, "search_batch")
+
+    attempts = 0
+    while len(have) < need and attempts < max_attempts:
+        attempts += 1
+        seed = SEED_LETTERS[secrets.randbelow(len(SEED_LETTERS))]
+        start = secrets.randbelow(max(1, total))
+
+        if has_batch:
+            data = await client.search_batch(lexicon_id=lexicon_id, offset=start, limit=batch_size, query=seed)
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get("items") or data.get("content") or []
+            else:
+                items = []
+        else:
+            items = []
+            window = min(batch_size, total)
+            for step in range(window):
+                idx = (start + step) % total
+                try:
+                    entry = await client.get_entry_by_index(lexicon_id=lexicon_id, index=idx, query=seed)
+                    items.append(entry)
+                except Exception:
+                    continue
+
+        for entry in items:
+            word = normalize_word(entry)   # diacritics preserved
+            if not word or not is_ar_letters_only(word):
+                continue
+            bare = strip_diacritics(word)
+            L = len(bare)
+            if not (min_len <= L <= max_len):
+                continue
+            if word in seen:
+                continue
+
+            eid = normalize_entry_id(entry)
+            definition = None
+            if eid:
+                senses = await client.get_senses(eid)
+                definition = extract_definition_from_senses(senses)
+
+            if not definition:
+                continue  # require definition for this endpoint
+
+            have.append((word, definition, eid))
+            seen.add(word)
+            if len(have) >= need:
+                break
+
+    return have
+
+@app.get("/words", response_model=WordListResponse)
+async def list_words(
+    count: int = Query(10, ge=1, le=100, description="How many words to return"),
+    min_len: int = Query(4, ge=2, le=20, description="Min length after removing diacritics"),
+    max_len: int = Query(7, ge=2, le=30, description="Max length after removing diacritics"),
+    db: AsyncSession = Depends(get_db),
+):
+    if min_len > max_len:
+        raise HTTPException(status_code=400, detail="min_len must be <= max_len")
+
+    ymd = datetime.now(TZ).strftime("%Y-%m-%d")
+    client = KSAAClient()
+
+    try:
+        lexicon_id = await client.find_lexicon_id()
+        total = await client.count_candidates(lexicon_id=lexicon_id)
+        if total <= 0:
+            raise HTTPException(status_code=502, detail="No entries found in the target lexicon")
+
+        triples = await _collect_words(
+            client=client,
+            lexicon_id=lexicon_id,
+            total=total,
+            need=count,
+            min_len=min_len,
+            max_len=max_len,
+            batch_size=BATCH_SIZE,
+            max_attempts=40,
+        )
+
+        items:
