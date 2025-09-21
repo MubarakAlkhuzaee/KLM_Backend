@@ -1,285 +1,123 @@
-# app/main.py
-from datetime import datetime
-import re
-import secrets
-import pytz
-
-from fastapi import FastAPI, HTTPException, Depends, Query
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Query
 from pydantic import BaseModel
+from datetime import date
+import httpx
+import os
+import random
 
-from sqlalchemy import select, delete
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import select
 
-# --- Create the FastAPI app FIRST ---
-app = FastAPI(title="Wordle Daily Arabic Word")
+from app.models import Base, DailyWordCache
 
-# CORS (open for testing; restrict allow_origins later to your domain)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
+SIWAR_API_KEY = os.getenv("SIWAR_API_KEY")
+LEXICON_ID = "Riyadh"
 
-# --- Project imports (after app is created is fine) ---
-from .db_pg import Base, engine, SessionLocal, ping
-from .models import DailyWordCache
-from .ksaa_client import KSAAClient  # must provide: find_lexicon_id, count_candidates, get_entry_by_index
-# If you added search_batch in KSAAClient, this file will use it automatically.
+app = FastAPI()
 
-# ---- Constants ----
-TZ = pytz.timezone("Asia/Riyadh")
-MIN_LEN, MAX_LEN = 4, 7            # Wordle-like length after stripping diacritics
-BATCH_SIZE = 50                    # entries per API batch (when available)
-MAX_RANDOM_TRIES = 12              # how many random offsets to attempt (batches) before giving up
+engine = create_async_engine(DATABASE_URL, echo=False)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-# ---- Local helpers (do not depend on upstream response shapes for validation) ----
-_AR_DIACRITICS = re.compile(r"[\u064B-\u0652\u0670]")  # tashkeel + dagger alif
-_AR_LETTERS    = re.compile(r"^[\u0621-\u064A]+$")     # Hamza..Yeh
 
-def strip_diacritics(s: str) -> str:
-    return _AR_DIACRITICS.sub("", s or "")
-
-def base_len_ar(s: str) -> int:
-    return len(strip_diacritics(s))
-
-def is_ar_letters_only(s: str) -> bool:
-    b = strip_diacritics(s or "")
-    return bool(b) and bool(_AR_LETTERS.match(b))
-
-def normalize_word(entry: dict) -> str:
-    # common headword fields
-    for k in ("lemma", "form", "headword", "word", "display", "text", "title"):
-        v = entry.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    # sometimes nested like form.text
-    form = entry.get("form")
-    if isinstance(form, dict):
-        for k in ("text", "value", "form"):
-            v = form.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-    return ""
-
-def normalize_entry_id(entry: dict):
-    # common id keys
-    for k in ("id", "entryId", "lexicalEntryId", "uuid", "uid", "eid"):
-        v = entry.get(k)
-        if isinstance(v, (str, int)) and str(v).strip():
-            return str(v)
-    meta = entry.get("meta") or entry.get("metadata") or {}
-    if isinstance(meta, dict):
-        for k in ("id", "entryId", "lexicalEntryId"):
-            v = meta.get(k)
-            if isinstance(v, (str, int)) and str(v).strip():
-                return str(v)
-    return None
-
-def extract_definition_from_senses(senses: list) -> str | None:
-    for s in senses or []:
-        # common direct fields
-        definition = (
-            s.get("definition_ar") or
-            s.get("definition") or
-            s.get("gloss_ar") or
-            s.get("gloss")
-        )
-        if not definition:
-            # list forms
-            defs = s.get("definitions") or s.get("definitionList")
-            if isinstance(defs, list) and defs:
-                ar = next(
-                    (d.get("text") for d in defs if isinstance(d, dict) and d.get("lang") in ("ar", "ara", "ar-SA")),
-                    None
-                )
-                definition = ar or (defs[0].get("text") if isinstance(defs[0], dict) else (defs[0] if defs else None))
-        if definition:
-            return definition
-    return None
-
-# ---- Pydantic response model ----
 class DailyWord(BaseModel):
     date: str
     word: str
     definition: str | None = None
     entry_id: str | None = None
-    lexicon_id: str | None = None
-    source: str = "معجم الرياض للغة العربية المعاصرة"
+    lexicon_id: str
+    source: str
 
-# ---- DB dependency ----
-async def get_db() -> AsyncSession:
-    async with SessionLocal() as session:
-        yield session
 
-# ---- lifecycle ----
 @app.on_event("startup")
 async def on_startup():
-    await ping()  # ensure DB reachable
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True}
 
 @app.get("/daily-word", response_model=DailyWord)
-async def daily_word(
-    db: AsyncSession = Depends(get_db),
-    refresh: bool = Query(False, description="Force a new random pick for today (bypass cache)"),
-):
-    ymd = datetime.now(TZ).strftime("%Y-%m-%d")
+async def get_daily_word(refresh: bool = Query(default=False)):
+    today = str(date.today())
 
-    # 1) Cache (skip if refresh=1)
-    if not refresh:
-        res = await db.execute(select(DailyWordCache).where(DailyWordCache.ymd == ymd))
-        row = res.scalar_one_or_none()
-        if row:
-            return DailyWord(
-                date=ymd,
-                word=row.word,
-                definition=row.definition,
-                entry_id=row.entry_id,
-                lexicon_id=row.lexicon_id,
+    async with AsyncSessionLocal() as session:
+        if not refresh:
+            # Try cache
+            cached = await session.get(DailyWordCache, today)
+            if cached:
+                return DailyWord(
+                    date=today,
+                    word=cached.word,
+                    definition=cached.definition,
+                    entry_id=cached.entry_id,
+                    lexicon_id=cached.lexicon_id,
+                    source="معجم الرياض للغة العربية المعاصرة"
+                )
+
+        # No cache or forced refresh — get random word
+        random_offset = random.randint(0, 3000)
+
+        async with httpx.AsyncClient() as client:
+            res = await client.get(
+                "https://siwar.ksaa.gov.sa/api/v1/external/public/search",
+                params={
+                    "lexiconId": LEXICON_ID,
+                    "offset": random_offset,
+                    "limit": 1
+                },
+                headers={
+                    "accept": "application/json",
+                    "apikey": SIWAR_API_KEY
+                }
             )
 
-    # 2) Compute today's random word and save it once
-    client = KSAAClient()
-    try:
-        lexicon_id = await client.find_lexicon_id()
-        total = await client.count_candidates(lexicon_id=lexicon_id)
-        if total <= 0:
-            raise HTTPException(status_code=502, detail="No entries found in the target lexicon")
+        if res.status_code != 200:
+            return {"detail": f"Upstream failure: {res.text}"}
 
-        # If refresh requested, clear today's row before generating
-        if refresh:
-            await db.execute(delete(DailyWordCache).where(DailyWordCache.ymd == ymd))
-            await db.commit()
+        data = res.json()
+        if not data or "content" not in data or not data["content"]:
+            return {"detail": "Could not find a suitable word today"}
 
-        # Strategy: try up to MAX_RANDOM_TRIES random offsets; fetch a batch if available; scan locally.
-        chosen_any: tuple[str, str | None, str | None] | None = None  # (word, def, entry_id)
+        entry = data["content"][0]
+        word = entry.get("entryHead", "")
+        entry_id = entry.get("entryId", None)
 
-        # Check if KSAAClient has a batch method; otherwise we fall back to single fetch loops.
-        has_batch = hasattr(client, "search_batch")
+        # Get definition
+        definition = None
+        if entry_id:
+            async with httpx.AsyncClient() as client:
+                def_res = await client.get(
+                    "https://siwar.ksaa.gov.sa/api/v1/external/public/senses",
+                    params={
+                        "entryId": entry_id,
+                        "lexiconId": LEXICON_ID
+                    },
+                    headers={
+                        "accept": "application/json",
+                        "apikey": SIWAR_API_KEY
+                    }
+                )
+            if def_res.status_code == 200:
+                senses = def_res.json()
+                if senses:
+                    definition = senses[0].get("definition", {}).get("value")
 
-        for _ in range(MAX_RANDOM_TRIES):
-            # pick a random starting offset
-            start = secrets.randbelow(max(1, total))
-
-            if has_batch:
-                # fetch a batch
-                data = await client.search_batch(lexicon_id=lexicon_id, offset=start, limit=BATCH_SIZE, query=None)
-
-                # normalize items
-                if isinstance(data, list):
-                    items = data
-                elif isinstance(data, dict):
-                    if isinstance(data.get("items"), list):
-                        items = data["items"]
-                    elif isinstance(data.get("content"), list):
-                        items = data["content"]
-                    else:
-                        items = []
-                else:
-                    items = []
-
-                # scan batch
-                best_with_def: tuple[str, str | None, str | None] | None = None
-                best_valid: tuple[str, str | None, str | None] | None = None
-
-                for entry in items:
-                    word = normalize_word(entry)
-                    if not word or not is_ar_letters_only(word):
-                        continue
-                    L = base_len_ar(word)
-                    if not (MIN_LEN <= L <= MAX_LEN):
-                        continue
-
-                    eid = normalize_entry_id(entry)
-                    definition = None
-                    if eid:
-                        senses = await client.get_senses(eid)
-                        definition = extract_definition_from_senses(senses)
-
-                    candidate = (word, definition, eid)
-                    if best_valid is None:
-                        best_valid = candidate
-                    if definition:
-                        best_with_def = candidate
-                        break  # prefer the first with a definition
-
-                if best_with_def:
-                    chosen_any = best_with_def
-                    break
-                if best_valid and chosen_any is None:
-                    chosen_any = best_valid
-            else:
-                # Fallback: no batch support; probe forward single entries near the random start
-                probe_window = min(BATCH_SIZE, total)
-                best_with_def = None
-                best_valid = None
-                for step in range(probe_window):
-                    idx = (start + step) % total
-                    entry = await client.get_entry_by_index(lexicon_id=lexicon_id, index=idx, query=None)
-
-                    word = normalize_word(entry)
-                    if not word or not is_ar_letters_only(word):
-                        continue
-                    L = base_len_ar(word)
-                    if not (MIN_LEN <= L <= MAX_LEN):
-                        continue
-
-                    eid = normalize_entry_id(entry)
-                    definition = None
-                    if eid:
-                        senses = await client.get_senses(eid)
-                        definition = extract_definition_from_senses(senses)
-
-                    candidate = (word, definition, eid)
-                    if best_valid is None:
-                        best_valid = candidate
-                    if definition:
-                        best_with_def = candidate
-                        break
-
-                if best_with_def:
-                    chosen_any = best_with_def
-                    break
-                if best_valid and chosen_any is None:
-                    chosen_any = best_valid
-
-        if not chosen_any:
-            raise HTTPException(status_code=502, detail="Could not find a suitable word today")
-
-        chosen_word, chosen_def, chosen_eid = chosen_any
-
-        # 3) UPSERT once for today's date (first writer wins)
-        stmt = insert(DailyWordCache).values(
-            ymd=ymd,
-            word=chosen_word,
-            definition=chosen_def,
-            entry_id=chosen_eid,
-            lexicon_id=lexicon_id,
-        ).on_conflict_do_nothing(index_elements=["ymd"])
-
-        await db.execute(stmt)
-        await db.commit()
-
-        # Read back what is stored (handles race where another request inserted first)
-        res = await db.execute(select(DailyWordCache).where(DailyWordCache.ymd == ymd))
-        row = res.scalar_one()
-        return DailyWord(
-            date=ymd,
-            word=row.word,
-            definition=row.definition,
-            entry_id=row.entry_id,
-            lexicon_id=row.lexicon_id,
+        # Cache it
+        obj = DailyWordCache(
+            ymd=today,
+            word=word,
+            definition=definition,
+            entry_id=entry_id,
+            lexicon_id=LEXICON_ID
         )
+        await session.merge(obj)
+        await session.commit()
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        # Surface upstream/bad-params problems clearly while keeping our API stable
-        raise HTTPException(status_code=502, detail=f"Upstream failure: {e}")
+        return DailyWord(
+            date=today,
+            word=word,
+            definition=definition,
+            entry_id=entry_id,
+            lexicon_id=LEXICON_ID,
+            source="معجم الرياض للغة العربية المعاصرة"
+        )
