@@ -107,26 +107,88 @@ def normalize_entry_id(entry: dict) -> Optional[str]:
                 return str(v)
     return None
 
-def extract_definition_from_senses(senses: list) -> Optional[str]:
-    for s in senses or []:
-        definition = (
-            s.get("definition_ar") or
-            s.get("definition") or
-            s.get("gloss_ar") or
-            s.get("gloss")
-        )
-        if not definition:
-            defs = s.get("definitions") or s.get("definitionList")
-            if isinstance(defs, list) and defs:
-                ar = next(
-                    (d.get("text") for d in defs
-                     if isinstance(d, dict) and d.get("lang") in ("ar","ara","ar-SA")),
-                    None
-                )
-                definition = ar or (defs[0].get("text") if isinstance(defs[0], dict) else (defs[0] if defs else None))
-        if definition:
-            return definition
+def _first_str(*vals):
+    for v in vals:
+        if isinstance(v, str) and v.strip():
+            return v.strip()
     return None
+
+def extract_definition_from_senses(senses: list) -> Optional[str]:
+    """
+    Try hard to pull an Arabic definition from varied shapes:
+    - s["definition"] as str or {"value": "..."}
+    - s["gloss"], s["gloss_ar"]
+    - s["representations"] / s["definitionRepresentations"] / "senseDefinitionRepresentations"
+      with items like {"lang":"ar","text":"..."} or {"value":"..."}
+    - s["statements"] / "statementRepresentations" etc., fallback to first text-y bit
+    """
+    for s in senses or []:
+        # simple direct fields
+        direct = _first_str(
+            s.get("definition_ar"),
+            s.get("gloss_ar"),
+            s.get("definition"),
+            s.get("gloss"),
+        )
+        if direct:
+            return direct
+
+        # definition may be an object
+        d = s.get("definition")
+        if isinstance(d, dict):
+            text = _first_str(d.get("value"), d.get("text"))
+            if text:
+                return text
+
+        # common representation arrays
+        for key in (
+            "representations",
+            "definitionRepresentations",
+            "senseDefinitionRepresentations",
+            "statementRepresentations",
+        ):
+            reps = s.get(key)
+            if isinstance(reps, list):
+                # prefer Arabic
+                for r in reps:
+                    if isinstance(r, dict) and (r.get("lang") in ("ar", "ara", "ar-SA", "ar_SA", "AR")):
+                        text = _first_str(r.get("text"), r.get("value"))
+                        if text:
+                            return text
+                # or just the first text-y one
+                for r in reps:
+                    if isinstance(r, dict):
+                        text = _first_str(r.get("text"), r.get("value"))
+                        if text:
+                            return text
+
+        # sometimes nested 'definitions' list
+        defs = s.get("definitions") or s.get("definitionList")
+        if isinstance(defs, list) and defs:
+            # prefer Arabic
+            for d in defs:
+                if isinstance(d, dict) and (d.get("lang") in ("ar", "ara", "ar-SA", "ar_SA", "AR")):
+                    text = _first_str(d.get("text"), d.get("value"))
+                    if text:
+                        return text
+            # otherwise first textual
+            for d in defs:
+                if isinstance(d, dict):
+                    text = _first_str(d.get("text"), d.get("value"))
+                    if text:
+                        return text
+                elif isinstance(d, str) and d.strip():
+                    return d.strip()
+
+        # last resort: scan obvious fields
+        for k in ("note", "comment", "example", "context"):
+            v = s.get(k)
+            text = _first_str(v)
+            if text:
+                return text
+
+    return None
+
 
 # ───────── Lifecycle ─────────
 @app.on_event("startup")
@@ -197,7 +259,7 @@ async def daily_word(
                     eid = normalize_entry_id(entry)
                     definition = None
                     if eid:
-                        senses = await client.get_senses(eid)
+                        senses = await client.get_senses(eid, lexicon_id=lexicon_id)
                         definition = extract_definition_from_senses(senses)
                     cand = (word, definition, eid)
                     if definition:
@@ -224,7 +286,7 @@ async def daily_word(
                     eid = normalize_entry_id(entry)
                     definition = None
                     if eid:
-                        senses = await client.get_senses(eid)
+                        senses = await client.get_senses(eid, lexicon_id=lexicon_id)
                         definition = extract_definition_from_senses(senses)
                     cand = (word, definition, eid)
                     if definition:
@@ -323,7 +385,7 @@ async def _collect_words(
             eid = normalize_entry_id(entry)
             definition = None
             if eid:
-                senses = await client.get_senses(eid)
+                senses = await client.get_senses(eid, lexicon_id=lexicon_id)
                 definition = extract_definition_from_senses(senses)
             if not definition:
                 continue  # require a definition

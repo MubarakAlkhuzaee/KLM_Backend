@@ -55,10 +55,10 @@ class KSAAClient:
             raise RuntimeError("KSAA_API_KEY is not set")
 
     async def find_lexicon_id(self) -> str:
-        # trust explicit env var (can be a code like "Riyadh")
+        # trust explicit env var first
         if LEXICON_ID_ENV:
             return LEXICON_ID_ENV
-        # otherwise resolve by name from public lexicons
+        # otherwise resolve by name
         data = await _http_get("/public/lexicons", {})
         items = data if isinstance(data, list) else data.get("items", [])
         for it in items:
@@ -101,9 +101,29 @@ class KSAAClient:
         """Fetch a batch of entries using whichever param style the API accepts."""
         return await self._search_try_both(query or DEFAULT_QUERY, lexicon_id, offset=offset, limit=limit)
 
-    async def get_senses(self, entry_id: str) -> List[Dict[str, Any]]:
-        # Try multiple param shapes
-        for params in ({"entryId": entry_id}, {"entryIds": entry_id}, {"lexicalEntryId": entry_id}):
+    async def get_senses(self, entry_id: str, lexicon_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Retrieve senses for an entry. Many deployments require BOTH entry id AND lexicon id.
+        Try several parameter shapes to be safe.
+        """
+        if not entry_id:
+            return []
+
+        param_sets = []
+        if lexicon_id:
+            param_sets.extend([
+                {"entryId": entry_id, "lexiconId": lexicon_id},
+                {"entryIds": entry_id, "lexiconId": lexicon_id},
+                {"lexicalEntryId": entry_id, "lexiconId": lexicon_id},
+            ])
+        # also try without lexiconId as a fallback
+        param_sets.extend([
+            {"entryId": entry_id},
+            {"entryIds": entry_id},
+            {"lexicalEntryId": entry_id},
+        ])
+
+        for params in param_sets:
             try:
                 data = await _http_get("/public/senses", params)
                 if isinstance(data, list):
@@ -113,8 +133,10 @@ class KSAAClient:
                 if "senses" in data and isinstance(data["senses"], list):
                     return data["senses"]
             except httpx.HTTPStatusError as e:
-                if e.response.status_code not in (400, 404):
-                    raise
+                # try the next param shape on 400/404
+                if e.response.status_code in (400, 404):
+                    continue
+                raise
         return []
 
 def pick_index_for_date(ymd: str, modulo: int) -> int:
