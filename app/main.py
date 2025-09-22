@@ -65,7 +65,7 @@ async def get_db() -> AsyncSession:
     async with SessionLocal() as session:
         yield session
 
-# ───────── Helpers (Arabic normalization) ─────────
+# ───────── Helpers (Arabic normalization + definition extraction) ─────────
 _AR_DIACRITICS = re.compile(r"[\u064B-\u0652\u0670]")  # tashkeel + dagger alif
 _AR_LETTERS    = re.compile(r"^[\u0621-\u064A]+$")
 
@@ -113,82 +113,115 @@ def _first_str(*vals):
             return v.strip()
     return None
 
-def extract_definition_from_senses(senses: list) -> Optional[str]:
+def extract_definition_from_senses(senses_payload) -> Optional[str]:
     """
-    Try hard to pull an Arabic definition from varied shapes:
-    - s["definition"] as str or {"value": "..."}
-    - s["gloss"], s["gloss_ar"]
-    - s["representations"] / s["definitionRepresentations"] / "senseDefinitionRepresentations"
-      with items like {"lang":"ar","text":"..."} or {"value":"..."}
-    - s["statements"] / "statementRepresentations" etc., fallback to first text-y bit
+    Accepts any payload returned by /public/senses:
+    - list[str]                                  -> first string
+    - list[dict] with key "senses": list[str]    -> first senses[0]
+    - dict/list with fields like definition/gloss/representations -> best-effort Arabic
     """
-    for s in senses or []:
-        # simple direct fields
+    # Case A: list of strings
+    if isinstance(senses_payload, list) and senses_payload and isinstance(senses_payload[0], str):
+        return senses_payload[0].strip() or None
+
+    # Case B: list of dicts (Swagger example: [{"senses": ["…"], "lemma": "…"}])
+    if isinstance(senses_payload, list) and senses_payload and isinstance(senses_payload[0], dict):
+        for s in senses_payload:
+            if isinstance(s, dict):
+                # direct strings in 'senses'
+                if isinstance(s.get("senses"), list) and s["senses"]:
+                    for item in s["senses"]:
+                        if isinstance(item, str) and item.strip():
+                            return item.strip()
+
+                # common direct fields
+                direct = _first_str(
+                    s.get("definition_ar"),
+                    s.get("gloss_ar"),
+                    s.get("definition"),
+                    s.get("gloss"),
+                )
+                if direct:
+                    return direct
+
+                # definition may be an object
+                d = s.get("definition")
+                if isinstance(d, dict):
+                    text = _first_str(d.get("value"), d.get("text"))
+                    if text:
+                        return text
+
+                # representation arrays
+                for key in (
+                    "representations",
+                    "definitionRepresentations",
+                    "senseDefinitionRepresentations",
+                    "statementRepresentations",
+                ):
+                    reps = s.get(key)
+                    if isinstance(reps, list) and reps:
+                        # prefer Arabic
+                        for r in reps:
+                            if isinstance(r, dict) and (r.get("lang") in ("ar","ara","ar-SA","ar_SA","AR")):
+                                text = _first_str(r.get("text"), r.get("value"))
+                                if text:
+                                    return text
+                        # otherwise first textual
+                        for r in reps:
+                            if isinstance(r, dict):
+                                text = _first_str(r.get("text"), r.get("value"))
+                                if text:
+                                    return text
+
+                # definitions array variant
+                defs = s.get("definitions") or s.get("definitionList")
+                if isinstance(defs, list) and defs:
+                    for d in defs:
+                        if isinstance(d, dict) and (d.get("lang") in ("ar", "ara", "ar-SA", "ar_SA", "AR")):
+                            text = _first_str(d.get("text"), d.get("value"))
+                            if text:
+                                return text
+                    for d in defs:
+                        if isinstance(d, dict):
+                            text = _first_str(d.get("text"), d.get("value"))
+                            if text:
+                                return text
+                        elif isinstance(d, str) and d.strip():
+                            return d.strip()
+        # if none matched, fall through
+
+    # Case C: single dict (rare)
+    if isinstance(senses_payload, dict):
         direct = _first_str(
-            s.get("definition_ar"),
-            s.get("gloss_ar"),
-            s.get("definition"),
-            s.get("gloss"),
+            senses_payload.get("definition_ar"),
+            senses_payload.get("gloss_ar"),
+            senses_payload.get("definition"),
+            senses_payload.get("gloss"),
         )
         if direct:
             return direct
 
-        # definition may be an object
-        d = s.get("definition")
+        d = senses_payload.get("definition")
         if isinstance(d, dict):
             text = _first_str(d.get("value"), d.get("text"))
             if text:
                 return text
 
-        # common representation arrays
-        for key in (
-            "representations",
-            "definitionRepresentations",
-            "senseDefinitionRepresentations",
-            "statementRepresentations",
-        ):
-            reps = s.get(key)
+        for key in ("representations","definitionRepresentations","senseDefinitionRepresentations","statementRepresentations"):
+            reps = senses_payload.get(key)
             if isinstance(reps, list):
-                # prefer Arabic
                 for r in reps:
-                    if isinstance(r, dict) and (r.get("lang") in ("ar", "ara", "ar-SA", "ar_SA", "AR")):
+                    if isinstance(r, dict) and (r.get("lang") in ("ar","ara","ar-SA","ar_SA","AR")):
                         text = _first_str(r.get("text"), r.get("value"))
                         if text:
                             return text
-                # or just the first text-y one
                 for r in reps:
                     if isinstance(r, dict):
                         text = _first_str(r.get("text"), r.get("value"))
                         if text:
                             return text
 
-        # sometimes nested 'definitions' list
-        defs = s.get("definitions") or s.get("definitionList")
-        if isinstance(defs, list) and defs:
-            # prefer Arabic
-            for d in defs:
-                if isinstance(d, dict) and (d.get("lang") in ("ar", "ara", "ar-SA", "ar_SA", "AR")):
-                    text = _first_str(d.get("text"), d.get("value"))
-                    if text:
-                        return text
-            # otherwise first textual
-            for d in defs:
-                if isinstance(d, dict):
-                    text = _first_str(d.get("text"), d.get("value"))
-                    if text:
-                        return text
-                elif isinstance(d, str) and d.strip():
-                    return d.strip()
-
-        # last resort: scan obvious fields
-        for k in ("note", "comment", "example", "context"):
-            v = s.get(k)
-            text = _first_str(v)
-            if text:
-                return text
-
     return None
-
 
 # ───────── Lifecycle ─────────
 @app.on_event("startup")
@@ -261,6 +294,11 @@ async def daily_word(
                     if eid:
                         senses = await client.get_senses(eid, lexicon_id=lexicon_id)
                         definition = extract_definition_from_senses(senses)
+                    if not definition:
+                        # 🔁 fallback: query-based senses (Swagger shape)
+                        senses_q = await client.get_senses_by_query(word, lexicon_id=lexicon_id)
+                        definition = extract_definition_from_senses(senses_q)
+
                     cand = (word, definition, eid)
                     if definition:
                         chosen = cand
@@ -288,6 +326,10 @@ async def daily_word(
                     if eid:
                         senses = await client.get_senses(eid, lexicon_id=lexicon_id)
                         definition = extract_definition_from_senses(senses)
+                    if not definition:
+                        senses_q = await client.get_senses_by_query(word, lexicon_id=lexicon_id)
+                        definition = extract_definition_from_senses(senses_q)
+
                     cand = (word, definition, eid)
                     if definition:
                         chosen = cand
@@ -388,6 +430,9 @@ async def _collect_words(
                 senses = await client.get_senses(eid, lexicon_id=lexicon_id)
                 definition = extract_definition_from_senses(senses)
             if not definition:
+                senses_q = await client.get_senses_by_query(word, lexicon_id=lexicon_id)
+                definition = extract_definition_from_senses(senses_q)
+            if not definition:
                 continue  # require a definition
 
             have.append((word, definition, eid))
@@ -450,3 +495,33 @@ async def list_words(
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream failure: {e}")
+
+# ───────── Backfill today's definition without changing the word ─────────
+@app.post("/daily-word/backfill-definition", response_model=DailyWord)
+async def backfill_definition(db: AsyncSession = Depends(get_db)):
+    ymd = datetime.now(TZ).strftime("%Y-%m-%d")
+    res = await db.execute(select(DailyWordCache).where(DailyWordCache.ymd == ymd))
+    row = res.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="No cached word for today")
+
+    if row.definition:
+        return DailyWord(date=ymd, word=row.word, definition=row.definition,
+                         entry_id=row.entry_id, lexicon_id=row.lexicon_id)
+
+    client = KSAAClient()
+    lexicon_id = row.lexicon_id or await client.find_lexicon_id()
+    definition = None
+    if row.entry_id:
+        senses = await client.get_senses(row.entry_id, lexicon_id=lexicon_id)
+        definition = extract_definition_from_senses(senses)
+    if not definition:
+        senses_q = await client.get_senses_by_query(row.word, lexicon_id=lexicon_id)
+        definition = extract_definition_from_senses(senses_q)
+    if not definition:
+        raise HTTPException(status_code=502, detail="Still could not find a definition upstream")
+
+    row.definition = definition
+    await db.commit()
+    return DailyWord(date=ymd, word=row.word, definition=row.definition,
+                     entry_id=row.entry_id, lexicon_id=lexicon_id)

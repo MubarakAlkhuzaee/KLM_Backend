@@ -1,5 +1,6 @@
 # app/ksaa_client.py
 from __future__ import annotations
+
 import os
 from typing import Any, Dict, List, Optional
 import httpx
@@ -13,14 +14,17 @@ LEXICON_NAME = os.getenv("KSAA_LEXICON_NAME", "معجم الرياض للغة ا
 HEADERS = {"accept": "application/json", "apikey": API_KEY}
 DEFAULT_QUERY = "ا"  # never send empty query
 
+
 def _q(q: Optional[str]) -> str:
     return q if (q and str(q).strip()) else DEFAULT_QUERY
+
 
 async def _http_get(path: str, params: Dict[str, Any]):
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(f"{API_BASE}{path}", headers=HEADERS, params=params)
         r.raise_for_status()
         return r.json()
+
 
 def _collect_total(data: Any) -> int:
     if isinstance(data, dict):
@@ -39,6 +43,7 @@ def _collect_total(data: Any) -> int:
         return max(1, len(data))
     return 0
 
+
 def _collect_items(data: Any) -> List[Dict[str, Any]]:
     if isinstance(data, list):
         return data
@@ -48,6 +53,7 @@ def _collect_items(data: Any) -> List[Dict[str, Any]]:
         if isinstance(data.get("content"), list):
             return data["content"]
     return []
+
 
 class KSAAClient:
     def __init__(self):
@@ -76,7 +82,7 @@ class KSAAClient:
         except httpx.HTTPStatusError as e:
             if e.response.status_code not in (400, 404):
                 raise
-        # B) lexiconIds + page/size
+        # B) lexiconIds + page/size (plural param, page-based)
         page = offset
         return await _http_get("/public/search", {
             "query": _q(query), "lexiconIds": lexicon_id, "page": page, "size": limit
@@ -138,6 +144,20 @@ class KSAAClient:
                     continue
                 raise
         return []
+
+    async def get_senses_by_query(self, query: str, lexicon_id: Optional[str] = None):
+        """
+        Some deployments of /public/senses expect ?query=...&lexiconIds=Riyadh (no entryId).
+        This mirrors the Swagger call that returned results for you.
+        """
+        if not query or not str(query).strip():
+            return []
+        params = {"query": query}
+        if lexicon_id:
+            # Swagger shows 'lexiconIds' (plural) taking a CSV list; single id works.
+            params["lexiconIds"] = lexicon_id
+        return await _http_get("/public/senses", params)
+
 
 def pick_index_for_date(ymd: str, modulo: int) -> int:
     digest = hashlib.sha256(ymd.encode("utf-8")).hexdigest()
