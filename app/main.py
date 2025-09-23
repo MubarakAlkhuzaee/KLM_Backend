@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 import secrets
 import re
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Set
 
 import pytz
 from fastapi import FastAPI, HTTPException, Depends, Query
@@ -20,12 +20,21 @@ from .ksaa_client import KSAAClient
 
 # ───────── Config ─────────
 TZ = pytz.timezone("Asia/Riyadh")
-MIN_LEN, MAX_LEN = 4, 7               # playable length after removing diacritics
-BATCH_SIZE = 50
-MAX_RANDOM_TRIES = 12
+MIN_LEN, MAX_LEN = 4, 7                # playable length after removing diacritics
+
+# Make search stronger for consistency
+BATCH_SIZE = 100                       # ↑ larger batches for more candidates
+MAX_RANDOM_TRIES = 20                  # ↑ more tries for /daily-word
+COLLECT_ATTEMPT_MULTIPLIER = 20        # tries ~= count * multiplier for /words
+COLLECT_ATTEMPTS_MIN = 200             # minimum attempts for /words
+
+# Seeds to ensure non-empty queries (letters + frequent patterns)
 SEED_LETTERS = [
     "ا","ب","ت","ث","ج","ح","خ","د","ذ","ر","ز",
     "س","ش","ص","ض","ط","ظ","ع","غ","ف","ق","ك","ل","م","ن","ه","و","ي"
+]
+SEED_PATTERNS = [
+    "ال","الم","است","مت","ات","ون","ية","تي","ين","تر","سي","عن","مع","قد","لا","من","في"
 ]
 
 # ───────── App ─────────
@@ -33,7 +42,7 @@ app = FastAPI(title="Kalam API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # tighten later
+    allow_origins=["*"],      # tighten before launch
     allow_methods=["GET","POST","OPTIONS"],
     allow_headers=["*"],
 )
@@ -234,6 +243,46 @@ async def on_startup():
 async def healthz():
     return {"ok": True}
 
+# ───────── internal candidate scan (shared) ─────────
+async def _scan_entries_for_candidate(
+    client: KSAAClient,
+    items: List[dict],
+    lexicon_id: str,
+    exclude_words: Set[str],
+    exclude_entry_ids: Set[str],
+) -> Optional[Tuple[str, Optional[str], Optional[str]]]:
+    """Return first valid (word, def, eid), preferring entries with definitions; skip excludes."""
+    best_valid: Optional[Tuple[str, Optional[str], Optional[str]]] = None
+
+    for entry in items:
+        word = normalize_word(entry)
+        if not word or not is_ar_letters_only(word):
+            continue
+        if not (MIN_LEN <= base_len_ar(word) <= MAX_LEN):
+            continue
+
+        eid = normalize_entry_id(entry)
+        # exclude same as cached (if refreshing)
+        if word in exclude_words or (eid and eid in exclude_entry_ids):
+            continue
+
+        # try to get definition by entry id, then fallback by query=word
+        definition = None
+        if eid:
+            senses = await client.get_senses(eid, lexicon_id=lexicon_id)
+            definition = extract_definition_from_senses(senses)
+        if not definition:
+            senses_q = await client.get_senses_by_query(word, lexicon_id=lexicon_id)
+            definition = extract_definition_from_senses(senses_q)
+
+        cand = (word, definition, eid)
+        if definition:
+            return cand
+        if best_valid is None:
+            best_valid = cand
+
+    return best_valid
+
 # ───────── /daily-word (random; saved once per day; refreshable) ─────────
 @app.get("/daily-word", response_model=DailyWord)
 async def daily_word(
@@ -242,21 +291,21 @@ async def daily_word(
 ):
     ymd = datetime.now(TZ).strftime("%Y-%m-%d")
 
-    # Cache unless refresh=1
-    if not refresh:
-        res = await db.execute(select(DailyWordCache).where(DailyWordCache.ymd == ymd))
-        row = res.scalar_one_or_none()
-        if row:
-            return DailyWord(
-                date=ymd,
-                word=row.word,
-                definition=row.definition,
-                entry_id=row.entry_id,
-                lexicon_id=row.lexicon_id,
-            )
+    # Load existing (so we can exclude it if refreshing)
+    res = await db.execute(select(DailyWordCache).where(DailyWordCache.ymd == ymd))
+    existing = res.scalar_one_or_none()
 
-    # If refresh: clear today's row
-    if refresh:
+    if existing and not refresh:
+        return DailyWord(
+            date=ymd,
+            word=existing.word,
+            definition=existing.definition,
+            entry_id=existing.entry_id,
+            lexicon_id=existing.lexicon_id,
+        )
+
+    # If refresh: clear today's row (we still have 'existing' to exclude)
+    if refresh and existing:
         await db.execute(delete(DailyWordCache).where(DailyWordCache.ymd == ymd))
         await db.commit()
 
@@ -267,11 +316,19 @@ async def daily_word(
         if total <= 0:
             raise HTTPException(status_code=502, detail="No entries found in the target lexicon")
 
+        exclude_words: Set[str] = set([existing.word]) if existing else set()
+        exclude_eids: Set[str] = set([existing.entry_id]) if (existing and existing.entry_id) else set()
+
         has_batch = hasattr(client, "search_batch")
         chosen: Optional[Tuple[str, Optional[str], Optional[str]]] = None  # (word, def, entry_id)
 
         for _attempt in range(MAX_RANDOM_TRIES):
-            seed = SEED_LETTERS[secrets.randbelow(len(SEED_LETTERS))]
+            # alternate between single letters and patterns
+            if secrets.randbits(1):
+                seed = SEED_LETTERS[secrets.randbelow(len(SEED_LETTERS))]
+            else:
+                seed = SEED_PATTERNS[secrets.randbelow(len(SEED_PATTERNS))]
+
             start = secrets.randbelow(max(1, total))
 
             if has_batch:
@@ -282,67 +339,32 @@ async def daily_word(
                     items = data.get("items") or data.get("content") or []
                 else:
                     items = []
-                best_valid = None
-                for entry in items:
-                    word = normalize_word(entry)
-                    if not word or not is_ar_letters_only(word):
-                        continue
-                    if not (MIN_LEN <= base_len_ar(word) <= MAX_LEN):
-                        continue
-                    eid = normalize_entry_id(entry)
-                    definition = None
-                    if eid:
-                        senses = await client.get_senses(eid, lexicon_id=lexicon_id)
-                        definition = extract_definition_from_senses(senses)
-                    if not definition:
-                        # 🔁 fallback: query-based senses (Swagger shape)
-                        senses_q = await client.get_senses_by_query(word, lexicon_id=lexicon_id)
-                        definition = extract_definition_from_senses(senses_q)
 
-                    cand = (word, definition, eid)
-                    if definition:
-                        chosen = cand
+                cand = await _scan_entries_for_candidate(client, items, lexicon_id, exclude_words, exclude_eids)
+                if cand:
+                    chosen = cand
+                    # if definition is None, keep it only if nothing better found later
+                    if cand[1]:  # has definition
                         break
-                    if best_valid is None:
-                        best_valid = cand
-                if chosen:
-                    break
-                if best_valid and not chosen:
-                    chosen = best_valid
             else:
                 # single-entry probe near random start
                 probe_window = min(BATCH_SIZE, total)
-                best_valid = None
+                window_items = []
                 for step in range(probe_window):
                     idx = (start + step) % total
-                    entry = await client.get_entry_by_index(lexicon_id=lexicon_id, index=idx, query=seed)
-                    word = normalize_word(entry)
-                    if not word or not is_ar_letters_only(word):
+                    try:
+                        entry = await client.get_entry_by_index(lexicon_id=lexicon_id, index=idx, query=seed)
+                        window_items.append(entry)
+                    except Exception:
                         continue
-                    if not (MIN_LEN <= base_len_ar(word) <= MAX_LEN):
-                        continue
-                    eid = normalize_entry_id(entry)
-                    definition = None
-                    if eid:
-                        senses = await client.get_senses(eid, lexicon_id=lexicon_id)
-                        definition = extract_definition_from_senses(senses)
-                    if not definition:
-                        senses_q = await client.get_senses_by_query(word, lexicon_id=lexicon_id)
-                        definition = extract_definition_from_senses(senses_q)
-
-                    cand = (word, definition, eid)
-                    if definition:
-                        chosen = cand
+                cand = await _scan_entries_for_candidate(client, window_items, lexicon_id, exclude_words, exclude_eids)
+                if cand:
+                    chosen = cand
+                    if cand[1]:
                         break
-                    if best_valid is None:
-                        best_valid = cand
-                if chosen:
-                    break
-                if best_valid and not chosen:
-                    chosen = best_valid
 
         if not chosen:
-            raise HTTPException(status_code=502, detail="Could not find a suitable word today")
+            raise HTTPException(status_code=502, detail="Could not find a suitable (different) word today")
 
         word, definition, eid = chosen
 
@@ -377,23 +399,33 @@ async def _collect_words(
     need: int,
     min_len: int,
     max_len: int,
-    batch_size: int = 50,
-    max_attempts: int = 30,
+    batch_size: int,
 ) -> List[Tuple[str, Optional[str], Optional[str]]]:
     """
-    Collect up to `need` words as (word_with_diacritics, definition, entry_id).
+    Collect EXACTLY `need` words (if feasible) as (word_with_diacritics, definition, entry_id).
     Requires a non-empty definition.
     """
     have: List[Tuple[str, Optional[str], Optional[str]]] = []
-    seen: set[str] = set()
+    seen_words: Set[str] = set()
+    seen_eids: Set[str] = set()
     has_batch = hasattr(client, "search_batch")
 
+    # dynamic, aggressive attempts for consistency
+    max_attempts = max(COLLECT_ATTEMPTS_MIN, need * COLLECT_ATTEMPT_MULTIPLIER)
     attempts = 0
+
     while len(have) < need and attempts < max_attempts:
         attempts += 1
-        seed = SEED_LETTERS[secrets.randbelow(len(SEED_LETTERS))]
+
+        # choose seed: letter or pattern
+        if secrets.randbits(1):
+            seed = SEED_LETTERS[secrets.randbelow(len(SEED_LETTERS))]
+        else:
+            seed = SEED_PATTERNS[secrets.randbelow(len(SEED_PATTERNS))]
+
         start = secrets.randbelow(max(1, total))
 
+        # fetch batch
         if has_batch:
             data = await client.search_batch(lexicon_id=lexicon_id, offset=start, limit=batch_size, query=seed)
             if isinstance(data, list):
@@ -413,18 +445,24 @@ async def _collect_words(
                 except Exception:
                     continue
 
+        # scan
         for entry in items:
-            word = normalize_word(entry)  # diacritics preserved
+            word = normalize_word(entry)
             if not word or not is_ar_letters_only(word):
                 continue
+
             bare = strip_diacritics(word)
             L = len(bare)
             if not (min_len <= L <= max_len):
                 continue
-            if word in seen:
+            if word in seen_words:
                 continue
 
             eid = normalize_entry_id(entry)
+            if eid and eid in seen_eids:
+                continue
+
+            # definition: entry-based first, then query-based fallback
             definition = None
             if eid:
                 senses = await client.get_senses(eid, lexicon_id=lexicon_id)
@@ -433,10 +471,13 @@ async def _collect_words(
                 senses_q = await client.get_senses_by_query(word, lexicon_id=lexicon_id)
                 definition = extract_definition_from_senses(senses_q)
             if not definition:
-                continue  # require a definition
+                continue  # /words requires definition
 
             have.append((word, definition, eid))
-            seen.add(word)
+            seen_words.add(word)
+            if eid:
+                seen_eids.add(eid)
+
             if len(have) >= need:
                 break
 
@@ -470,8 +511,14 @@ async def list_words(
             min_len=min_len,
             max_len=max_len,
             batch_size=BATCH_SIZE,
-            max_attempts=40,
         )
+
+        if len(triples) < count:
+            # Strong signal something upstream is too sparse for constraints
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not collect {count} items with definitions. Found {len(triples)}. Try reducing min_len/max_len or count."
+            )
 
         items_out: List[WordItem] = []
         for (word, definition, eid) in triples:
@@ -495,33 +542,3 @@ async def list_words(
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream failure: {e}")
-
-# ───────── Backfill today's definition without changing the word ─────────
-@app.post("/daily-word/backfill-definition", response_model=DailyWord)
-async def backfill_definition(db: AsyncSession = Depends(get_db)):
-    ymd = datetime.now(TZ).strftime("%Y-%m-%d")
-    res = await db.execute(select(DailyWordCache).where(DailyWordCache.ymd == ymd))
-    row = res.scalar_one_or_none()
-    if not row:
-        raise HTTPException(status_code=404, detail="No cached word for today")
-
-    if row.definition:
-        return DailyWord(date=ymd, word=row.word, definition=row.definition,
-                         entry_id=row.entry_id, lexicon_id=row.lexicon_id)
-
-    client = KSAAClient()
-    lexicon_id = row.lexicon_id or await client.find_lexicon_id()
-    definition = None
-    if row.entry_id:
-        senses = await client.get_senses(row.entry_id, lexicon_id=lexicon_id)
-        definition = extract_definition_from_senses(senses)
-    if not definition:
-        senses_q = await client.get_senses_by_query(row.word, lexicon_id=lexicon_id)
-        definition = extract_definition_from_senses(senses_q)
-    if not definition:
-        raise HTTPException(status_code=502, detail="Still could not find a definition upstream")
-
-    row.definition = definition
-    await db.commit()
-    return DailyWord(date=ymd, word=row.word, definition=row.definition,
-                     entry_id=row.entry_id, lexicon_id=lexicon_id)
