@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete
 from sqlalchemy.dialects.postgresql import insert
 
 from .db_pg import Base, engine, SessionLocal
@@ -206,9 +206,8 @@ async def senses_by_entry(client: httpx.AsyncClient, entry_id: str) -> Any:
 
 # DB helpers
 async def clear_table(session: AsyncSession):
-    # Start fresh each run
-    await session.execute(func.now())  # no-op to ensure connection
-    await session.execute(f"TRUNCATE TABLE {YearWord.__tablename__} RESTART IDENTITY;")
+    # Delete all rows; TRUNCATE isn't necessary (and requires text()).
+    await session.execute(delete(YearWord))
 
 async def upsert_year_word(session: AsyncSession, idx: int, word: str, bare: str, length: int,
                            entry_id: Optional[str], lexicon_id: str,
